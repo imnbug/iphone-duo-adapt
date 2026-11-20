@@ -1,4 +1,4 @@
-// DuoAdapt.m - iPhone Duo (iOS 27.1) Safe & Deep UIKit Adaptation for Douyin
+// DuoAdapt.m - iPhone Duo (iOS 27.1) Full Native & UIKit Deep Adaptation for Douyin
 #import <UIKit/UIKit.h>
 #import <objc/runtime.h>
 #import <objc/message.h>
@@ -61,8 +61,16 @@ static NSArray *duo_foldDeviceModelList(id self, SEL _cmd) {
 }
 
 // ============================================================================
-// 5. Dynamic Fold/Unfold TabBar Position & Width Guard (No Recursion!)
+// 5. Dynamic Screen Width & Right Interaction Buttons Pinning
 // ============================================================================
+static CGFloat duo_currentWindowWidth(UIView *view) {
+    UIWindow *win = view.window;
+    if (win && win.bounds.size.width > 100) {
+        return win.bounds.size.width;
+    }
+    return [UIScreen mainScreen].bounds.size.width;
+}
+
 static BOOL gInTabBarSetFrame = NO;
 static void (*orig_tabBar_setFrame)(UIView *self, SEL _cmd, CGRect frame) = NULL;
 static void duo_tabBar_setFrame(UIView *self, SEL _cmd, CGRect frame) {
@@ -81,6 +89,61 @@ static void duo_tabBar_setFrame(UIView *self, SEL _cmd, CGRect frame) {
     }
     if (orig_tabBar_setFrame) {
         orig_tabBar_setFrame(self, _cmd, frame);
+    }
+}
+
+// Pin right interaction buttons (Avatar, Like, Comment, Favorite, Share, Mute) to right edge!
+static void duo_pinRightViewsInContainer(UIView *rootView, CGFloat containerWidth) {
+    if (!rootView || containerWidth < 300) return;
+    for (UIView *sub in rootView.subviews) {
+        NSString *clsName = NSStringFromClass([sub class]);
+        CGRect f = sub.frame;
+        // Check if this is the right interaction stack/container (narrow width 40~110pt, stuck near center 250~550pt on a wide screen >600pt)
+        BOOL isRightClass = ([clsName containsString:@"RightElement"] ||
+                             [clsName containsString:@"RightContainer"] ||
+                             [clsName isEqualToString:@"AWEElementContainer"] ||
+                             [clsName isEqualToString:@"AWEElementStackView"]);
+        if (containerWidth > 500 && f.size.width >= 36 && f.size.width <= 120 && f.size.height >= 180) {
+            if (isRightClass || (f.origin.x > 240 && f.origin.x < containerWidth - f.size.width - 60)) {
+                f.origin.x = containerWidth - f.size.width - 8.0;
+                sub.frame = f;
+            }
+        }
+        // Also expand full-width interaction overlay containers that were stuck at 375~430pt width
+        if (containerWidth > 500 && f.origin.x == 0 && f.size.width >= 350 && f.size.width <= 460 && f.size.height > 300) {
+            if ([clsName containsString:@"Interaction"] || [clsName containsString:@"Container"] || [clsName containsString:@"TableView"] || [clsName containsString:@"Cell"]) {
+                f.size.width = containerWidth;
+                sub.frame = f;
+            }
+        }
+        if (sub.subviews.count > 0 && sub.subviews.count < 30) {
+            duo_pinRightViewsInContainer(sub, containerWidth);
+        }
+    }
+}
+
+static void (*orig_playInteraction_viewDidLayoutSubviews)(UIViewController *self, SEL _cmd) = NULL;
+static void duo_playInteraction_viewDidLayoutSubviews(UIViewController *self, SEL _cmd) {
+    if (orig_playInteraction_viewDidLayoutSubviews) {
+        orig_playInteraction_viewDidLayoutSubviews(self, _cmd);
+    }
+    SEL selFoldUpdate = sel_registerName("awe_updateFoldElementLayoutIfViewSizeChanged");
+    if ([self respondsToSelector:selFoldUpdate]) {
+        ((void (*)(id, SEL))objc_msgSend)(self, selFoldUpdate);
+    }
+    SEL selFoldRightUpdate = sel_registerName("awe_updateFoldRightElementLayoutIfNeeded");
+    if ([self respondsToSelector:selFoldRightUpdate]) {
+        ((void (*)(id, SEL))objc_msgSend)(self, selFoldRightUpdate);
+    }
+    UIView *v = self.view;
+    if (v) {
+        CGFloat w = duo_currentWindowWidth(v);
+        if (w > 300 && fabs(v.frame.size.width - w) > 1.0) {
+            CGRect vf = v.frame;
+            vf.size.width = w;
+            v.frame = vf;
+        }
+        duo_pinRightViewsInContainer(v, w);
     }
 }
 
@@ -103,7 +166,7 @@ static void hookOrAddMethod(Class cls, SEL sel, IMP imp, const char *types, IMP 
     Method m = class_getInstanceMethod(cls, sel);
     if (m) {
         IMP cur = method_getImplementation(m);
-        if (cur == imp) return; // Already hooked! Prevent origOut from pointing to our own IMP!
+        if (cur == imp) return;
         if (origOut && *origOut == NULL) {
             *origOut = cur;
         }
@@ -186,7 +249,13 @@ static void applyAwemeCoreDeepAdaptation(void) {
             hookOrAddMethod(aweTabBarCls, @selector(setFrame:), (IMP)duo_tabBar_setFrame, "v@:{CGRect={CGPoint=dd}{CGSize=dd}}", (IMP *)&orig_tabBar_setFrame);
         }
 
-        // 4. Disable vertical bar on all AWE TabBar/Navigation subclasses
+        // 4. Pin Right Interaction Buttons (Like, Comment, Favorite, Share) to the right edge of current screen
+        Class playInteractionVC = NSClassFromString(@"AWEPlayInteractionViewController");
+        if (playInteractionVC) {
+            hookOrAddMethod(playInteractionVC, @selector(viewDidLayoutSubviews), (IMP)duo_playInteraction_viewDidLayoutSubviews, "v@:", (IMP *)&orig_playInteraction_viewDidLayoutSubviews);
+        }
+
+        // 5. Disable vertical bar on all AWE TabBar/Navigation subclasses
         SEL selVertBehavior = sel_registerName("preferredVerticalBarBehavior");
         SEL selChildVert = sel_registerName("childForPreferredVerticalBarBehavior");
         NSArray<NSString *> *aweVCClasses = @[
@@ -208,6 +277,11 @@ static void applyAwemeCoreDeepAdaptation(void) {
 __attribute__((constructor))
 static void duo_adapt_init(void) {
     @autoreleasepool {
+        // 0. Ensure LoadControl never disables DuoAdapt.dylib
+        NSUserDefaults *ud = [NSUserDefaults standardUserDefaults];
+        [ud setBool:YES forKey:@"LoadControl.Plugin.DuoAdapt.dylib"];
+        [ud removeObjectForKey:@"LC_AutoDisabledCulprit"];
+
         // 1. Globally disable iOS 27.1 vertical side-bar on UIKit base classes
         SEL selVertBehavior = sel_registerName("preferredVerticalBarBehavior");
         SEL selChildVert = sel_registerName("childForPreferredVerticalBarBehavior");
