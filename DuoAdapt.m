@@ -61,48 +61,13 @@ static NSArray *duo_foldDeviceModelList(id self, SEL _cmd) {
 }
 
 // ============================================================================
-// 5. Top Status Bar / Notification Bar Safe Area Avoidance
+// 5. Top Bar Inline Avoidance: Shrink Top Bar Left to Share Row with Right Status Pill
 // ============================================================================
-static CGFloat duo_effectiveTopSafeInset(UIWindow *win) {
-    CGFloat top = 0;
-    if (win) {
-        if (win.windowScene && win.windowScene.statusBarManager) {
-            CGFloat sbH = win.windowScene.statusBarManager.statusBarFrame.size.height;
-            if (sbH > top) top = sbH;
-        }
-    }
-    // On iPhone Duo (both outer screen and inner unfolded screen), the status bar / notification pill
-    // sits in the top ~54pt zone. Ensure at least 54pt top safe inset so top bar never overlaps it.
-    if (top < 54.0) {
-        top = 54.0;
-    }
-    return top;
-}
-
-static UIEdgeInsets (*orig_window_safeAreaInsets)(UIWindow *self, SEL _cmd) = NULL;
-static UIEdgeInsets duo_window_safeAreaInsets(UIWindow *self, SEL _cmd) {
-    UIEdgeInsets insets = orig_window_safeAreaInsets ? orig_window_safeAreaInsets(self, _cmd) : UIEdgeInsetsZero;
-    CGFloat minTop = duo_effectiveTopSafeInset(self);
-    if (insets.top < minTop) {
-        insets.top = minTop;
-    }
-    if (insets.bottom < 24.0) {
-        insets.bottom = 24.0;
-    }
-    return insets;
-}
-
-static CGRect (*orig_statusBarManager_statusBarFrame)(UIStatusBarManager *self, SEL _cmd) = NULL;
-static CGRect duo_statusBarManager_statusBarFrame(UIStatusBarManager *self, SEL _cmd) {
-    CGRect r = orig_statusBarManager_statusBarFrame ? orig_statusBarManager_statusBarFrame(self, _cmd) : CGRectZero;
-    if (r.size.height < 54.0) {
-        r.size.height = 54.0;
-    }
-    if (r.size.width < 100.0) {
-        r.size.width = [UIScreen mainScreen].bounds.size.width;
-    }
-    return r;
-}
+// On iPhone Duo, the status pill (time + battery/signal ring) sits at the top-right corner (~108pt wide, centered at y ~ 24pt).
+// By shrinking AWEFeedTopBarContainer's width to (windowWidth - 115pt) and moving it up to the status bar row (y = 8pt),
+// the menu, segment tabs, and search icon sit cleanly to the left of the status pill on the exact same top row!
+static const CGFloat kDuoRightStatusPillWidth = 115.0;
+static const CGFloat kDuoTopBarInlineY = 8.0;
 
 static BOOL gInTopBarSetFrame = NO;
 static void (*orig_topBar_setFrame)(UIView *self, SEL _cmd, CGRect frame) = NULL;
@@ -110,14 +75,14 @@ static void duo_topBar_setFrame(UIView *self, SEL _cmd, CGRect frame) {
     if (!gInTopBarSetFrame) {
         gInTopBarSetFrame = YES;
         UIWindow *win = self.window;
-        CGFloat minTop = duo_effectiveTopSafeInset(win);
-        // If AWEFeedTopBarContainer is placed too high (overlapping status bar at y < minTop)
-        // and its height is a compact bar (< 80pt), push it down to minTop!
-        if (frame.origin.y >= 0 && frame.origin.y < minTop - 4.0 && frame.size.height > 20 && frame.size.height < 85) {
-            frame.origin.y = minTop;
-        }
-        if (win && win.bounds.size.width > 300 && frame.origin.x == 0 && frame.size.width > 300) {
-            frame.size.width = win.bounds.size.width;
+        CGFloat winW = (win && win.bounds.size.width > 200) ? win.bounds.size.width : [UIScreen mainScreen].bounds.size.width;
+        CGFloat maxTopBarWidth = winW - kDuoRightStatusPillWidth;
+        if (winW > 300 && frame.origin.x <= 20.0) {
+            frame.origin.x = 0;
+            frame.size.width = maxTopBarWidth;
+            if (frame.origin.y > kDuoTopBarInlineY && frame.origin.y < 90.0 && frame.size.height > 20.0 && frame.size.height < 85.0) {
+                frame.origin.y = kDuoTopBarInlineY;
+            }
         }
         gInTopBarSetFrame = NO;
     }
@@ -128,24 +93,36 @@ static void duo_topBar_setFrame(UIView *self, SEL _cmd, CGRect frame) {
 
 static void (*orig_topBar_layoutSubviews)(UIView *self, SEL _cmd) = NULL;
 static void duo_topBar_layoutSubviews(UIView *self, SEL _cmd) {
+    UIWindow *win = self.window;
+    CGFloat winW = (win && win.bounds.size.width > 200) ? win.bounds.size.width : [UIScreen mainScreen].bounds.size.width;
+    CGFloat maxTopBarWidth = winW - kDuoRightStatusPillWidth;
+    CGRect f = self.frame;
+    if (winW > 300 && f.origin.x <= 20.0) {
+        BOOL changed = NO;
+        if (fabs(f.size.width - maxTopBarWidth) > 1.0) {
+            f.origin.x = 0;
+            f.size.width = maxTopBarWidth;
+            changed = YES;
+        }
+        if (f.origin.y > kDuoTopBarInlineY && f.origin.y < 90.0 && f.size.height > 20.0 && f.size.height < 85.0) {
+            f.origin.y = kDuoTopBarInlineY;
+            changed = YES;
+        }
+        if (changed) {
+            self.frame = f;
+        }
+    }
     if (orig_topBar_layoutSubviews) {
         orig_topBar_layoutSubviews(self, _cmd);
     }
-    UIWindow *win = self.window;
-    CGFloat minTop = duo_effectiveTopSafeInset(win);
-    CGRect f = self.frame;
-    if (f.origin.y >= 0 && f.origin.y < minTop - 4.0 && f.size.height > 20 && f.size.height < 85) {
-        f.origin.y = minTop;
-        self.frame = f;
-    } else if (f.origin.y == 0 && f.size.height >= 85 && f.size.height <= 140) {
-        // If AWEFeedTopBarContainer starts at y=0 and includes statusBar height inside its own height,
-        // ensure its subviews (left button, segment control, search button) sit below minTop!
-        for (UIView *sub in self.subviews) {
-            CGRect sf = sub.frame;
-            if (sf.origin.y >= 0 && sf.origin.y < minTop - 6.0 && sf.size.height > 16 && sf.size.height < 64) {
-                sf.origin.y = minTop + 4.0;
-                sub.frame = sf;
-            }
+    // Ensure any right-aligned subview inside AWEFeedTopBarContainer (such as the search icon / rightContainer)
+    // stays within maxTopBarWidth (i.e., to the left of the status bar pill)
+    CGFloat curW = self.bounds.size.width;
+    for (UIView *sub in self.subviews) {
+        CGRect sf = sub.frame;
+        if (sf.origin.x + sf.size.width > curW) {
+            sf.origin.x = MAX(0.0, curW - sf.size.width - 4.0);
+            sub.frame = sf;
         }
     }
 }
@@ -336,7 +313,7 @@ static void applyAwemeCoreDeepAdaptation(void) {
             hookOrAddMethod(aweTabBarCls, @selector(setFrame:), (IMP)duo_tabBar_setFrame, "v@:{CGRect={CGPoint=dd}{CGSize=dd}}", (IMP *)&orig_tabBar_setFrame);
         }
 
-        // 4. Automatic Top Bar Avoidance of Status/Notification Bar
+        // 4. Shrink Top Bar Left so it shares the top row with the right status/notification pill
         Class topBarCls = NSClassFromString(@"AWEFeedTopBarContainer");
         if (topBarCls) {
             hookOrAddMethod(topBarCls, @selector(setFrame:), (IMP)duo_topBar_setFrame, "v@:{CGRect={CGPoint=dd}{CGSize=dd}}", (IMP *)&orig_topBar_setFrame);
@@ -393,27 +370,20 @@ static void duo_adapt_init(void) {
         }
         hookOrAddMethod([UIViewController class], @selector(viewDidAppear:), (IMP)duo_vc_viewDidAppear, "v@:B", (IMP *)&orig_vc_viewDidAppear);
 
-        // 2. Ensure Window Safe Area & StatusBarManager always reserve >= 54pt at the top for notification/status bar
-        hookOrAddMethod([UIWindow class], @selector(safeAreaInsets), (IMP)duo_window_safeAreaInsets, "{UIEdgeInsets=dddd}@:", (IMP *)&orig_window_safeAreaInsets);
-        Class sbMgrCls = NSClassFromString(@"UIStatusBarManager");
-        if (sbMgrCls) {
-            hookOrAddMethod(sbMgrCls, @selector(statusBarFrame), (IMP)duo_statusBarManager_statusBarFrame, "{CGRect={CGPoint=dd}{CGSize=dd}}@:", (IMP *)&orig_statusBarManager_statusBarFrame);
-        }
-
-        // 3. Lock UITabBarController to standard bottom tabBar mode
+        // 2. Lock UITabBarController to standard bottom tabBar mode
         Class tabVCCls = [UITabBarController class];
         if (tabVCCls) {
             hookOrAddMethod(tabVCCls, sel_registerName("mode"), (IMP)duo_tabBarControllerMode, "q@:", NULL);
             hookOrAddMethod(tabVCCls, sel_registerName("setMode:"), (IMP)duo_setTabBarControllerMode, "v@:q", NULL);
         }
 
-        // 4. Force Phone Idiom & Compact Horizontal Size Class
+        // 3. Force Phone Idiom & Compact Horizontal Size Class
         hookOrAddMethod([UIDevice class], @selector(userInterfaceIdiom), (IMP)duo_userInterfaceIdiom, "q@:", NULL);
         hookOrAddMethod([UITraitCollection class], @selector(userInterfaceIdiom), (IMP)duo_userInterfaceIdiom, "q@:", NULL);
         hookOrAddMethod([UITraitCollection class], @selector(horizontalSizeClass), (IMP)duo_horizontalSizeClass, "q@:", NULL);
         hookOrAddMethod([UITraitCollection class], @selector(verticalSizeClass), (IMP)duo_verticalSizeClass, "q@:", NULL);
 
-        // 5. Apply AwemeCore deep adaptation once on launch
+        // 4. Apply AwemeCore deep adaptation once on launch
         applyAwemeCoreDeepAdaptation();
     }
 }
