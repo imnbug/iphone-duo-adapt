@@ -120,10 +120,18 @@ static void duo_align(UIView *root, UIView *vcRoot, UIWindow *win, int depth) {
             CGFloat rawY = r.origin.y - t.ty;
             CGFloat rawMaxY = CGRectGetMaxY(r) - t.ty;
 
+            // Safety guard: if the view is off-screen (e.g. preloading cell or horizontal swipe transition),
+            // reset transform to identity and never kick it off-screen!
+            if (rawX < -10.0 || rawX + b.size.width > W + 10.0 || rawY < -10.0 || rawMaxY > H + 10.0) {
+                duo_setTranslation(sub, 0, 0);
+                continue;
+            }
+
             CGFloat dx = 0, dy = 0;
             if (isRight) {
-                dx = (W - r.size.width - 18.0) - rawX;
-                if (dx < 20.0) dx = 0;
+                CGFloat targetX = W - b.size.width - 18.0;
+                dx = targetX - rawX;
+                if (dx < 20.0 || dx > W * 0.55) dx = 0;
             } else if (rawX > W * 0.45 || rawY < H * 0.25) {
                 // not the bottom-left caption block
                 if (sub.subviews.count > 0 && sub.subviews.count < 25) duo_align(sub, vcRoot, win, depth + 1);
@@ -131,7 +139,7 @@ static void duo_align(UIView *root, UIView *vcRoot, UIWindow *win, int depth) {
             }
             if (tall) {
                 CGFloat diff = targetBottom - rawMaxY;
-                if (diff > 40.0 && diff < H * 0.48) dy = diff;
+                if (diff > 40.0 && diff < H * 0.45 && (rawMaxY + diff) <= H - 80.0) dy = diff;
             }
             duo_setTranslation(sub, dx, dy);
             if (dx > 0.5 || dy > 0.5) {
