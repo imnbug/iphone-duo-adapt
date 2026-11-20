@@ -1,43 +1,191 @@
-name: Build iPhone Duo Adapt Dylib
+name: Unsigned iOS 27.1 DuoAdapt
 
 on:
-  push:
-    branches: ["main", "master"]
+  pull_request:
   workflow_dispatch:
+  push:
+    branches:
+      - main
+      - master
+      - "cursor/**"
 
 permissions:
-  contents: write
+  contents: read
+  actions: write
 
 jobs:
-  build:
-    runs-on: macos-latest
+  layout-tests:
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
 
-      - name: Compile DuoAdapt.dylib for arm64 & arm64e
+      - name: Reject device-specific layout shortcuts
         run: |
-          SDK_PATH=$(xcrun --sdk iphoneos --show-sdk-path)
-          xcrun --sdk iphoneos clang -dynamiclib \
-            -arch arm64 -arch arm64e \
-            -isysroot "$SDK_PATH" \
-            -miphoneos-version-min=15.0 \
-            -fobjc-arc \
-            -framework Foundation -framework UIKit -framework CoreGraphics \
-            -install_name "@executable_path/Frameworks/DuoAdapt.dylib" \
-            DuoAdapt.m -o DuoAdapt.dylib
-          codesign -f -s - DuoAdapt.dylib
-          file DuoAdapt.dylib
-          otool -L DuoAdapt.dylib
+          set -euo pipefail
+          if grep -nE "UIScreen\.main|mainScreen|userInterfaceIdiom|horizontalSizeClass|verticalSizeClass|statusBarOrientation|interfaceOrientation|UIDeviceOrientation|1878|1398|2670|2034|iPhone19|A3447|A3719|A3721|A3720" DuoAdapt.m DuoLayout.c DuoLayout.h; then
+            echo "layout source contains a device whitelist, a main-screen read, or a hardcoded Duo size"
+            exit 1
+          fi
 
-      - name: Upload Artifact
+      - name: Run layout tests
+        run: |
+          set -euo pipefail
+          cc -std=c11 -Wall -Werror -o test_duo_layout DuoLayout.c test_duo_layout.c
+          ./test_duo_layout
+
+  unsigned-dylib:
+    runs-on: xcode-27
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Select Xcode 27.1 and require the iOS 27.1 SDK
+        run: |
+          set -euo pipefail
+          PROBE="$GITHUB_WORKSPACE/sdk-probe.txt"
+          : > "$PROBE"
+          XCODE_APP="/Applications/Xcode_27.1.app"
+          {
+            echo "runner label: xcode-27"
+            sw_vers || true
+            echo "applications:"
+            ls /Applications | grep -i xcode || true
+          } | tee -a "$PROBE"
+          if [ ! -d "$XCODE_APP" ]; then
+            echo "Xcode 27.1 is not installed at $XCODE_APP. Refusing to fall back to another Xcode." | tee -a "$PROBE"
+            exit 1
+          fi
+          sudo xcode-select -s "$XCODE_APP/Contents/Developer"
+          xcode-select -p | tee -a "$PROBE"
+          xcodebuild -version | tee -a "$PROBE"
+          XCODE_VER="$(xcodebuild -version | sed -n '1s/^Xcode //p')"
+          case "$XCODE_VER" in
+            27.1|27.1.0) ;;
+            *)
+              echo "Refusing to build: selected Xcode is '$XCODE_VER', expected 27.1." | tee -a "$PROBE"
+              exit 1
+              ;;
+          esac
+          SDK_VER="$(xcrun --sdk iphoneos --show-sdk-version)"
+          SDK_PATH="$(xcrun --sdk iphoneos --show-sdk-path)"
+          {
+            echo "iphoneos SDK version: $SDK_VER"
+            echo "iphoneos SDK path: $SDK_PATH"
+            xcrun --sdk iphoneos --show-sdk-build-version || true
+            echo "--- installed iphoneos SDKs ---"
+            xcodebuild -showsdks | grep -i iphoneos || true
+          } | tee -a "$PROBE"
+          case "$SDK_VER" in
+            27.1|27.1.*) ;;
+            *)
+              echo "Refusing to build: iphoneos SDK is '$SDK_VER', expected 27.1. An older SDK must not impersonate 27.1." | tee -a "$PROBE"
+              exit 1
+              ;;
+          esac
+          case "$SDK_PATH" in
+            *[Ii]PhoneOS27.1.sdk*) ;;
+            *)
+              echo "Refusing to build: SDK path does not identify iOS 27.1: $SDK_PATH" | tee -a "$PROBE"
+              exit 1
+              ;;
+          esac
+          UIKIT="$SDK_PATH/System/Library/Frameworks/UIKit.framework/Headers"
+          {
+            echo "--- UIKit header probe ---"
+            if [ -d "$UIKIT" ]; then
+              grep -R -n -E "UIVerticalBarBehavior|preferredVerticalBarBehavior|verticalBarEdge|reservedRegion|UIHinge|UITabBarControllerMode" "$UIKIT" || true
+            else
+              echo "UIKit headers directory missing: $UIKIT"
+            fi
+            echo "--- availability macros ---"
+            find "$SDK_PATH/usr/include" -name 'AvailabilityVersions.h' -print || true
+          } | tee -a "$PROBE"
+          grep -R -n "define __IPHONE_27_1" "$SDK_PATH/usr/include/AvailabilityVersions.h" "$SDK_PATH/usr/include"/*/AvailabilityVersions.h 2>/dev/null | tee -a "$PROBE" || true
+
+      - name: Upload SDK probe
+        if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: DuoAdapt-dylib
-          path: DuoAdapt.dylib
+          name: ios-27-1-sdk-probe
+          path: sdk-probe.txt
+          if-no-files-found: ignore
 
-      - name: Publish Release
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      - name: Compile unsigned DuoAdapt.dylib
         run: |
-          gh release delete v1.0.0 -y --cleanup-tag || true
-          gh release create v1.0.0 DuoAdapt.dylib --title "iPhone Duo iOS 27.1 Adapt Dylib" --notes "Compiled arm64/arm64e dylib for iPhone Duo adaptation"
+          set -euo pipefail
+          cc -std=c11 -Wall -Werror -o test_duo_layout DuoLayout.c test_duo_layout.c
+          ./test_duo_layout
+          SDK_PATH="$(xcrun --sdk iphoneos --show-sdk-path)"
+          build_arch() {
+            local arch="$1"
+            local dir="build-$arch"
+            mkdir -p "$dir"
+            xcrun --sdk iphoneos clang -c DuoLayout.c \
+              -arch "$arch" \
+              -isysroot "$SDK_PATH" \
+              -miphoneos-version-min=15.0 \
+              -o "$dir/DuoLayout.o"
+            xcrun --sdk iphoneos clang -c DuoAdapt.m \
+              -fobjc-arc \
+              -arch "$arch" \
+              -isysroot "$SDK_PATH" \
+              -miphoneos-version-min=15.0 \
+              -o "$dir/DuoAdapt.o"
+            xcrun --sdk iphoneos clang -dynamiclib \
+              -arch "$arch" \
+              -isysroot "$SDK_PATH" \
+              -miphoneos-version-min=15.0 \
+              -install_name "@executable_path/Frameworks/DuoAdapt.dylib" \
+              "$dir/DuoAdapt.o" "$dir/DuoLayout.o" \
+              -framework Foundation -framework UIKit -framework CoreGraphics \
+              -framework AVFoundation -framework QuartzCore \
+              -o "$dir/DuoAdapt.dylib"
+          }
+          build_arch arm64
+          build_arch arm64e
+          lipo -create build-arm64/DuoAdapt.dylib build-arm64e/DuoAdapt.dylib -output DuoAdapt.dylib
+          if codesign -d DuoAdapt.dylib >/dev/null 2>&1; then
+            codesign --remove-signature DuoAdapt.dylib
+          fi
+          if codesign -d DuoAdapt.dylib >/dev/null 2>&1; then
+            echo "dylib is still signed; this job must not produce a signed binary"
+            exit 1
+          fi
+          file DuoAdapt.dylib
+          lipo -info DuoAdapt.dylib
+          otool -L DuoAdapt.dylib
+
+      - name: Verify minimum OS stayed 15.0 and the linked SDK is 27.1
+        run: |
+          set -euo pipefail
+          vtool -show-build DuoAdapt.dylib | tee build-version.txt
+          python3 - << 'PY'
+          import pathlib, sys
+          text = pathlib.Path("build-version.txt").read_text()
+          mins, sdks = [], []
+          for raw in text.splitlines():
+              line = raw.strip()
+              if line.startswith("minos "):
+                  mins.append(line.split()[1])
+              elif line.startswith("sdk "):
+                  sdks.append(line.split()[1])
+          print("minos values:", mins)
+          print("sdk values:", sdks)
+          if not mins or not sdks:
+              sys.exit("vtool output has no minos/sdk; refusing to guess the deployment target")
+          for value in mins:
+              if value != "15.0":
+                  sys.exit(f"minimum OS changed to {value}; expected 15.0")
+          for value in sdks:
+              if value != "27.1" and not value.startswith("27.1."):
+                  sys.exit(f"linked SDK is {value}; expected 27.1")
+          print("confirmed minos 15.0 and sdk 27.1")
+          PY
+
+      - name: Upload unsigned dylib
+        uses: actions/upload-artifact@v4
+        with:
+          name: DuoAdapt-unsigned-dylib
+          path: |
+            DuoAdapt.dylib
+            build-version.txt
+          if-no-files-found: error
