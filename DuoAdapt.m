@@ -1,4 +1,4 @@
-// DuoAdapt.m - iPhone Duo (iOS 27.1) Full Native & UIKit Deep Adaptation for Douyin
+// DuoAdapt.m - iPhone Duo (iOS 27.1) Safe & Non-Blocking UIKit Adaptation for Douyin
 #import <UIKit/UIKit.h>
 #import <objc/runtime.h>
 #import <objc/message.h>
@@ -61,83 +61,8 @@ static NSArray *duo_foldDeviceModelList(id self, SEL _cmd) {
 }
 
 // ============================================================================
-// 5. Top Bar Inline Avoidance: Shrink Top Bar Left to Share Row with Right Status Pill
+// 5. Dynamic Fold/Unfold TabBar Position & Width Guard (No layoutSubviews hook!)
 // ============================================================================
-// On iPhone Duo, the status pill (time + battery/signal ring) sits at the top-right corner (~108pt wide, centered at y ~ 24pt).
-// By shrinking AWEFeedTopBarContainer's width to (windowWidth - 115pt) and moving it up to the status bar row (y = 8pt),
-// the menu, segment tabs, and search icon sit cleanly to the left of the status pill on the exact same top row!
-static const CGFloat kDuoRightStatusPillWidth = 115.0;
-static const CGFloat kDuoTopBarInlineY = 8.0;
-
-static BOOL gInTopBarSetFrame = NO;
-static void (*orig_topBar_setFrame)(UIView *self, SEL _cmd, CGRect frame) = NULL;
-static void duo_topBar_setFrame(UIView *self, SEL _cmd, CGRect frame) {
-    if (!gInTopBarSetFrame) {
-        gInTopBarSetFrame = YES;
-        UIWindow *win = self.window;
-        CGFloat winW = (win && win.bounds.size.width > 200) ? win.bounds.size.width : [UIScreen mainScreen].bounds.size.width;
-        CGFloat maxTopBarWidth = winW - kDuoRightStatusPillWidth;
-        if (winW > 300 && frame.origin.x <= 20.0) {
-            frame.origin.x = 0;
-            frame.size.width = maxTopBarWidth;
-            if (frame.origin.y > kDuoTopBarInlineY && frame.origin.y < 90.0 && frame.size.height > 20.0 && frame.size.height < 85.0) {
-                frame.origin.y = kDuoTopBarInlineY;
-            }
-        }
-        gInTopBarSetFrame = NO;
-    }
-    if (orig_topBar_setFrame) {
-        orig_topBar_setFrame(self, _cmd, frame);
-    }
-}
-
-static void (*orig_topBar_layoutSubviews)(UIView *self, SEL _cmd) = NULL;
-static void duo_topBar_layoutSubviews(UIView *self, SEL _cmd) {
-    UIWindow *win = self.window;
-    CGFloat winW = (win && win.bounds.size.width > 200) ? win.bounds.size.width : [UIScreen mainScreen].bounds.size.width;
-    CGFloat maxTopBarWidth = winW - kDuoRightStatusPillWidth;
-    CGRect f = self.frame;
-    if (winW > 300 && f.origin.x <= 20.0) {
-        BOOL changed = NO;
-        if (fabs(f.size.width - maxTopBarWidth) > 1.0) {
-            f.origin.x = 0;
-            f.size.width = maxTopBarWidth;
-            changed = YES;
-        }
-        if (f.origin.y > kDuoTopBarInlineY && f.origin.y < 90.0 && f.size.height > 20.0 && f.size.height < 85.0) {
-            f.origin.y = kDuoTopBarInlineY;
-            changed = YES;
-        }
-        if (changed) {
-            self.frame = f;
-        }
-    }
-    if (orig_topBar_layoutSubviews) {
-        orig_topBar_layoutSubviews(self, _cmd);
-    }
-    // Ensure any right-aligned subview inside AWEFeedTopBarContainer (such as the search icon / rightContainer)
-    // stays within maxTopBarWidth (i.e., to the left of the status bar pill)
-    CGFloat curW = self.bounds.size.width;
-    for (UIView *sub in self.subviews) {
-        CGRect sf = sub.frame;
-        if (sf.origin.x + sf.size.width > curW) {
-            sf.origin.x = MAX(0.0, curW - sf.size.width - 4.0);
-            sub.frame = sf;
-        }
-    }
-}
-
-// ============================================================================
-// 6. Dynamic Screen Width & Right Interaction Buttons Pinning
-// ============================================================================
-static CGFloat duo_currentWindowWidth(UIView *view) {
-    UIWindow *win = view.window;
-    if (win && win.bounds.size.width > 100) {
-        return win.bounds.size.width;
-    }
-    return [UIScreen mainScreen].bounds.size.width;
-}
-
 static BOOL gInTabBarSetFrame = NO;
 static void (*orig_tabBar_setFrame)(UIView *self, SEL _cmd, CGRect frame) = NULL;
 static void duo_tabBar_setFrame(UIView *self, SEL _cmd, CGRect frame) {
@@ -156,58 +81,6 @@ static void duo_tabBar_setFrame(UIView *self, SEL _cmd, CGRect frame) {
     }
     if (orig_tabBar_setFrame) {
         orig_tabBar_setFrame(self, _cmd, frame);
-    }
-}
-
-static void duo_pinRightViewsInContainer(UIView *rootView, CGFloat containerWidth) {
-    if (!rootView || containerWidth < 300) return;
-    for (UIView *sub in rootView.subviews) {
-        NSString *clsName = NSStringFromClass([sub class]);
-        CGRect f = sub.frame;
-        BOOL isRightClass = ([clsName containsString:@"RightElement"] ||
-                             [clsName containsString:@"RightContainer"] ||
-                             [clsName isEqualToString:@"AWEElementContainer"] ||
-                             [clsName isEqualToString:@"AWEElementStackView"]);
-        if (containerWidth > 500 && f.size.width >= 36 && f.size.width <= 120 && f.size.height >= 180) {
-            if (isRightClass || (f.origin.x > 240 && f.origin.x < containerWidth - f.size.width - 60)) {
-                f.origin.x = containerWidth - f.size.width - 8.0;
-                sub.frame = f;
-            }
-        }
-        if (containerWidth > 500 && f.origin.x == 0 && f.size.width >= 350 && f.size.width <= 460 && f.size.height > 300) {
-            if ([clsName containsString:@"Interaction"] || [clsName containsString:@"Container"] || [clsName containsString:@"TableView"] || [clsName containsString:@"Cell"]) {
-                f.size.width = containerWidth;
-                sub.frame = f;
-            }
-        }
-        if (sub.subviews.count > 0 && sub.subviews.count < 30) {
-            duo_pinRightViewsInContainer(sub, containerWidth);
-        }
-    }
-}
-
-static void (*orig_playInteraction_viewDidLayoutSubviews)(UIViewController *self, SEL _cmd) = NULL;
-static void duo_playInteraction_viewDidLayoutSubviews(UIViewController *self, SEL _cmd) {
-    if (orig_playInteraction_viewDidLayoutSubviews) {
-        orig_playInteraction_viewDidLayoutSubviews(self, _cmd);
-    }
-    SEL selFoldUpdate = sel_registerName("awe_updateFoldElementLayoutIfViewSizeChanged");
-    if ([self respondsToSelector:selFoldUpdate]) {
-        ((void (*)(id, SEL))objc_msgSend)(self, selFoldUpdate);
-    }
-    SEL selFoldRightUpdate = sel_registerName("awe_updateFoldRightElementLayoutIfNeeded");
-    if ([self respondsToSelector:selFoldRightUpdate]) {
-        ((void (*)(id, SEL))objc_msgSend)(self, selFoldRightUpdate);
-    }
-    UIView *v = self.view;
-    if (v) {
-        CGFloat w = duo_currentWindowWidth(v);
-        if (w > 300 && fabs(v.frame.size.width - w) > 1.0) {
-            CGRect vf = v.frame;
-            vf.size.width = w;
-            v.frame = vf;
-        }
-        duo_pinRightViewsInContainer(v, w);
     }
 }
 
@@ -313,20 +186,7 @@ static void applyAwemeCoreDeepAdaptation(void) {
             hookOrAddMethod(aweTabBarCls, @selector(setFrame:), (IMP)duo_tabBar_setFrame, "v@:{CGRect={CGPoint=dd}{CGSize=dd}}", (IMP *)&orig_tabBar_setFrame);
         }
 
-        // 4. Shrink Top Bar Left so it shares the top row with the right status/notification pill
-        Class topBarCls = NSClassFromString(@"AWEFeedTopBarContainer");
-        if (topBarCls) {
-            hookOrAddMethod(topBarCls, @selector(setFrame:), (IMP)duo_topBar_setFrame, "v@:{CGRect={CGPoint=dd}{CGSize=dd}}", (IMP *)&orig_topBar_setFrame);
-            hookOrAddMethod(topBarCls, @selector(layoutSubviews), (IMP)duo_topBar_layoutSubviews, "v@:", (IMP *)&orig_topBar_layoutSubviews);
-        }
-
-        // 5. Pin Right Interaction Buttons (Like, Comment, Favorite, Share) to the right edge of current screen
-        Class playInteractionVC = NSClassFromString(@"AWEPlayInteractionViewController");
-        if (playInteractionVC) {
-            hookOrAddMethod(playInteractionVC, @selector(viewDidLayoutSubviews), (IMP)duo_playInteraction_viewDidLayoutSubviews, "v@:", (IMP *)&orig_playInteraction_viewDidLayoutSubviews);
-        }
-
-        // 6. Disable vertical bar on all AWE TabBar/Navigation subclasses
+        // 4. Disable vertical bar on all AWE TabBar/Navigation subclasses
         SEL selVertBehavior = sel_registerName("preferredVerticalBarBehavior");
         SEL selChildVert = sel_registerName("childForPreferredVerticalBarBehavior");
         NSArray<NSString *> *aweVCClasses = @[
@@ -348,11 +208,6 @@ static void applyAwemeCoreDeepAdaptation(void) {
 __attribute__((constructor))
 static void duo_adapt_init(void) {
     @autoreleasepool {
-        // 0. Ensure LoadControl never disables DuoAdapt.dylib
-        NSUserDefaults *ud = [NSUserDefaults standardUserDefaults];
-        [ud setBool:YES forKey:@"LoadControl.Plugin.DuoAdapt.dylib"];
-        [ud removeObjectForKey:@"LC_AutoDisabledCulprit"];
-
         // 1. Globally disable iOS 27.1 vertical side-bar on UIKit base classes
         SEL selVertBehavior = sel_registerName("preferredVerticalBarBehavior");
         SEL selChildVert = sel_registerName("childForPreferredVerticalBarBehavior");
