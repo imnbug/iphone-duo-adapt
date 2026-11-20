@@ -23,7 +23,7 @@ jobs:
             -miphoneos-version-min=15.0 \
             -fobjc-arc \
             -framework Foundation -framework UIKit -framework CoreGraphics \
-            -install_name "@executable_path/Frameworks/请别暂停音乐_2.3.1.dylib" \
+            -install_name "@executable_path/Frameworks/DuoAdapt.dylib" \
             DuoAdapt.m -o DuoAdapt.dylib
           codesign -f -s - DuoAdapt.dylib
           file DuoAdapt.dylib
