@@ -44,25 +44,95 @@ static BOOL duo_returnNO(id self, SEL _cmd) {
     return NO;
 }
 
-static BOOL duo_returnYES(id self, SEL _cmd) {
-    return YES;
+// ============================================================================
+// 4. Native AWEFoldDeviceDetector Disabled (Keep Right Buttons at Right Edge!)
+// ============================================================================
+static NSArray *duo_emptyFoldDeviceModelList(id self, SEL _cmd) {
+    return @[];
 }
 
 // ============================================================================
-// 4. Native AWEFoldDeviceDetector Model List
+// 5. Query iOS 27.1 Notification Bar / Occlusion Region Safe Bounds Dynamically
 // ============================================================================
-static NSArray *duo_foldDeviceModelList(id self, SEL _cmd) {
-    return @[
-        @"iPhone18,1", @"iPhone18,2", @"iPhone18,3", @"iPhone18,4", @"iPhone18,5",
-        @"iPhone19,1", @"iPhone19,2", @"iPhone19,3", @"iPhone19,4", @"iPhone19,5",
-        @"iPhone19,6", @"iPhone19,7", @"iPhone19,8", @"iPhone20,1", @"iPhone20,2",
-        @"iPhone Duo"
-    ];
+// Queries iOS 27.1's UIViewReservedRegion (occlusionRegionKind) or statusBarFrame
+// to find the exact bounding box of the top-right notification/status pill.
+static CGRect duo_queryTopRightNotificationRect(UIView *view) {
+    if (!view) return CGRectZero;
+    UIWindow *win = view.window;
+    UIView *refView = win ? (UIView *)win : view;
+    CGFloat winW = refView.bounds.size.width;
+    if (winW < 200) return CGRectZero;
+
+    // 1. Try iOS 27.1 official UIViewReservedRegion API: [refView reservedRegionsOfKind:[UIViewReservedRegionKind occlusionRegionKind]]
+    Class kindCls = NSClassFromString(@"UIViewReservedRegionKind");
+    SEL selOccKind = sel_registerName("occlusionRegionKind");
+    SEL selResRegions = sel_registerName("reservedRegionsOfKind:");
+    if (kindCls && [kindCls respondsToSelector:selOccKind] && [refView respondsToSelector:selResRegions]) {
+        id occKind = ((id (*)(id, SEL))objc_msgSend)(kindCls, selOccKind);
+        if (occKind) {
+            NSArray *regions = ((NSArray * (*)(id, SEL, id))objc_msgSend)(refView, selResRegions, occKind);
+            if ([regions isKindOfClass:[NSArray class]]) {
+                SEL selFrame = @selector(frame);
+                for (id reg in regions) {
+                    if ([reg respondsToSelector:selFrame]) {
+                        CGRect r = ((CGRect (*)(id, SEL))objc_msgSend)(reg, selFrame);
+                        // Check if this occlusion region is in the top-right corner
+                        if (r.origin.y < 80.0 && r.size.width > 20.0 && (r.origin.x + r.size.width) > winW * 0.55) {
+                            return r;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // 2. Fallback: Query windowScene.statusBarManager.statusBarFrame
+    if (win && win.windowScene && win.windowScene.statusBarManager) {
+        CGRect sbFrame = win.windowScene.statusBarManager.statusBarFrame;
+        if (sbFrame.size.height > 0 && sbFrame.size.height < 90.0) {
+            // If statusBarFrame is a top-right pill, use its exact rect;
+            // if it spans full width, the actual right status cluster occupies the rightmost ~106pt.
+            if (sbFrame.origin.x > winW * 0.5 && sbFrame.size.width > 20.0) {
+                return sbFrame;
+            }
+            return CGRectMake(winW - 106.0, sbFrame.origin.y, 106.0, sbFrame.size.height);
+        }
+    }
+    return CGRectZero;
 }
 
 // ============================================================================
-// 5. Dynamic Fold/Unfold TabBar Position & Width Guard (No layoutSubviews hook!)
+// 6. One-Way setFrame: Input Adjustment (Zero layoutSubviews hooks = Zero Freeze!)
 // ============================================================================
+static BOOL gInTopBarSetFrame = NO;
+static void (*orig_topBar_setFrame)(UIView *self, SEL _cmd, CGRect frame) = NULL;
+static void duo_topBar_setFrame(UIView *self, SEL _cmd, CGRect frame) {
+    if (!gInTopBarSetFrame) {
+        gInTopBarSetFrame = YES;
+        UIWindow *win = self.window;
+        CGFloat winW = (win && win.bounds.size.width > 200) ? win.bounds.size.width : [UIScreen mainScreen].bounds.size.width;
+        CGRect notifRect = duo_queryTopRightNotificationRect(self);
+        if (notifRect.size.width > 0 && notifRect.origin.x > 200) {
+            CGFloat safeMaxWidth = notifRect.origin.x - 8.0;
+            if (frame.origin.x <= 20.0 && frame.size.width > safeMaxWidth) {
+                frame.size.width = safeMaxWidth - frame.origin.x;
+            }
+            // Align topBar vertically with the notification bar center if topBar is in the top zone
+            if (frame.origin.y >= 0 && frame.origin.y < 90.0 && frame.size.height > 20.0 && frame.size.height < 80.0 && notifRect.size.height > 10.0) {
+                CGFloat alignedY = notifRect.origin.y + (notifRect.size.height - frame.size.height) * 0.5;
+                if (alignedY < 4.0) alignedY = 4.0;
+                frame.origin.y = alignedY;
+            }
+        } else if (winW > 300 && frame.origin.x <= 20.0 && frame.size.width > winW - 108.0) {
+            frame.size.width = (winW - 108.0) - frame.origin.x;
+        }
+        gInTopBarSetFrame = NO;
+    }
+    if (orig_topBar_setFrame) {
+        orig_topBar_setFrame(self, _cmd, frame);
+    }
+}
+
 static BOOL gInTabBarSetFrame = NO;
 static void (*orig_tabBar_setFrame)(UIView *self, SEL _cmd, CGRect frame) = NULL;
 static void duo_tabBar_setFrame(UIView *self, SEL _cmd, CGRect frame) {
@@ -118,28 +188,37 @@ static void hookOrAddMethod(Class cls, SEL sel, IMP imp, const char *types, IMP 
 static void applyAwemeCoreDeepAdaptation(void) {
     static dispatch_once_t onceToken;
     dispatch_once(&onceToken, ^{
-        // 1. Force AWEPad* classes to return NO for isPad / isPadUI / isPadSplitScreen checks
-        NSArray<NSString *> *padClasses = @[
+        // 1. Force AWEPad* AND AWEFold* layout classes to return NO so Douyin never pushes
+        // the right interaction buttons (Like/Comment/Favorite/Share) to the middle of the screen!
+        NSArray<NSString *> *padAndFoldClasses = @[
             @"AWEPadModuleAdapter", @"AWEPadBizUIAdapter", @"AWEPadFullPageAdapter",
             @"AWEPadSplitScreenAdapter", @"AWEPadSplitScreenAdapterImpl",
             @"AWEPadTabBarControllerAdapter", @"AWEPadTabBarAdapter",
             @"AWEPadUIAdaptor", @"AWEPadUIAdaption", @"AWEPadLeftSideBarAdapter",
             @"AWEPadUserPageAdapter", @"AWEPadDetailTableAdapter", @"AWEPadPureModeAdapter",
-            @"AWEDeviceManager", @"UIDevice"
+            @"AWEDeviceManager", @"UIDevice",
+            @"AWEFoldDeviceDetector", @"AWEPlayInteractionFoldElementLayoutService",
+            @"AWEPlayInteractionFoldRightElementLayout", @"AWEPlayInteractionElementContainer",
+            @"AWEPlayInteractionRightElementContainer", @"AWEPlayInteractionViewController",
+            @"AWEDetailFoldAdaptUtil", @"AWEDCFeedPadFoldUtil"
         ];
-        NSArray<NSString *> *isPadSelectors = @[
+        NSArray<NSString *> *disableSelectors = @[
             @"isPad", @"isIPad", @"isIpad", @"isiPad", @"isPadDevice", @"isIPadDevice",
             @"awe_isIpad", @"btd_isPadDevice", @"iesll_isPadDevice", @"acc_isIPad",
             @"cj_isPad", @"deviceIsIpad", @"checkIsPad", @"htslive_isiPad",
             @"puzzle_isiPad", @"sc_isPadDevice", @"isPadUI", @"isPadSplitScreen",
             @"isPadSplit", @"isPadSplitStyle", @"isPadLayout", @"isPadAdaptionMode",
-            @"isInSplitScreen"
+            @"isInSplitScreen",
+            @"isFoldDevice", @"isFold", @"p_isFoldDevice", @"isDynamicFoldDevice",
+            @"shouldUseFoldElementLayout", @"shouldUseFoldableLayout",
+            @"isPadOrFold", @"isPadOrFoldDevice", @"isPadOrFoldAdaptationEnabled",
+            @"padOrFoldLayoutEnabled", @"shouldAdaptPadFoldLayout"
         ];
-        for (NSString *clsName in padClasses) {
+        for (NSString *clsName in padAndFoldClasses) {
             Class cls = NSClassFromString(clsName);
             if (!cls) continue;
             Class metaCls = object_getClass(cls);
-            for (NSString *selName in isPadSelectors) {
+            for (NSString *selName in disableSelectors) {
                 SEL sel = sel_registerName(selName.UTF8String);
                 if (class_getInstanceMethod(cls, sel)) {
                     hookOrAddMethod(cls, sel, (IMP)duo_returnNO, "B@:", NULL);
@@ -150,40 +229,35 @@ static void applyAwemeCoreDeepAdaptation(void) {
             }
         }
 
-        // 2. Enable AWEFoldDeviceDetector
         Class foldDetector = NSClassFromString(@"AWEFoldDeviceDetector");
         if (foldDetector) {
             Class metaFold = object_getClass(foldDetector);
-            NSArray<NSString *> *foldSels = @[@"isFoldDevice", @"isFold", @"p_isFoldDevice", @"isDynamicFoldDevice"];
-            for (NSString *s in foldSels) {
-                SEL sel = sel_registerName(s.UTF8String);
-                if (class_getInstanceMethod(foldDetector, sel)) {
-                    hookOrAddMethod(foldDetector, sel, (IMP)duo_returnYES, "B@:", NULL);
-                }
-                if (metaFold && class_getInstanceMethod(metaFold, sel)) {
-                    hookOrAddMethod(metaFold, sel, (IMP)duo_returnYES, "B@:", NULL);
-                }
-            }
             SEL listSel = sel_registerName("foldDeviceModelList");
             SEL defListSel = sel_registerName("defaultFoldDeviceModelList");
             if (class_getInstanceMethod(foldDetector, listSel)) {
-                hookOrAddMethod(foldDetector, listSel, (IMP)duo_foldDeviceModelList, "@@:", NULL);
+                hookOrAddMethod(foldDetector, listSel, (IMP)duo_emptyFoldDeviceModelList, "@@:", NULL);
             }
             if (class_getInstanceMethod(foldDetector, defListSel)) {
-                hookOrAddMethod(foldDetector, defListSel, (IMP)duo_foldDeviceModelList, "@@:", NULL);
+                hookOrAddMethod(foldDetector, defListSel, (IMP)duo_emptyFoldDeviceModelList, "@@:", NULL);
             }
             if (metaFold && class_getInstanceMethod(metaFold, listSel)) {
-                hookOrAddMethod(metaFold, listSel, (IMP)duo_foldDeviceModelList, "@@:", NULL);
+                hookOrAddMethod(metaFold, listSel, (IMP)duo_emptyFoldDeviceModelList, "@@:", NULL);
             }
             if (metaFold && class_getInstanceMethod(metaFold, defListSel)) {
-                hookOrAddMethod(metaFold, defListSel, (IMP)duo_foldDeviceModelList, "@@:", NULL);
+                hookOrAddMethod(metaFold, defListSel, (IMP)duo_emptyFoldDeviceModelList, "@@:", NULL);
             }
         }
 
-        // 3. Pin AWENormalModeTabBar to bottom and auto-resize across outer/inner display
+        // 2. Pin AWENormalModeTabBar to bottom via setFrame: only
         Class aweTabBarCls = NSClassFromString(@"AWENormalModeTabBar");
         if (aweTabBarCls) {
             hookOrAddMethod(aweTabBarCls, @selector(setFrame:), (IMP)duo_tabBar_setFrame, "v@:{CGRect={CGPoint=dd}{CGSize=dd}}", (IMP *)&orig_tabBar_setFrame);
+        }
+
+        // 3. Adjust AWEFeedTopBarContainer via setFrame: only (using queried notification bar bounds, zero layoutSubviews loop!)
+        Class topBarCls = NSClassFromString(@"AWEFeedTopBarContainer");
+        if (topBarCls) {
+            hookOrAddMethod(topBarCls, @selector(setFrame:), (IMP)duo_topBar_setFrame, "v@:{CGRect={CGPoint=dd}{CGSize=dd}}", (IMP *)&orig_topBar_setFrame);
         }
 
         // 4. Disable vertical bar on all AWE TabBar/Navigation subclasses
