@@ -45,17 +45,8 @@ static BOOL duo_returnNO(id self, SEL _cmd) {
 }
 
 // ============================================================================
-// 4. Native AWEFoldDeviceDetector Disabled (Keep Right Buttons at Right Edge!)
+// 4. Query iOS 27.1 Notification Bar / Occlusion Region Safe Bounds Dynamically
 // ============================================================================
-static NSArray *duo_emptyFoldDeviceModelList(id self, SEL _cmd) {
-    return @[];
-}
-
-// ============================================================================
-// 5. Query iOS 27.1 Notification Bar / Occlusion Region Safe Bounds Dynamically
-// ============================================================================
-// Queries iOS 27.1's UIViewReservedRegion (occlusionRegionKind) or statusBarFrame
-// to find the exact bounding box of the top-right notification/status pill.
 static CGRect duo_queryTopRightNotificationRect(UIView *view) {
     if (!view) return CGRectZero;
     UIWindow *win = view.window;
@@ -63,7 +54,6 @@ static CGRect duo_queryTopRightNotificationRect(UIView *view) {
     CGFloat winW = refView.bounds.size.width;
     if (winW < 200) return CGRectZero;
 
-    // 1. Try iOS 27.1 official UIViewReservedRegion API: [refView reservedRegionsOfKind:[UIViewReservedRegionKind occlusionRegionKind]]
     Class kindCls = NSClassFromString(@"UIViewReservedRegionKind");
     SEL selOccKind = sel_registerName("occlusionRegionKind");
     SEL selResRegions = sel_registerName("reservedRegionsOfKind:");
@@ -76,7 +66,6 @@ static CGRect duo_queryTopRightNotificationRect(UIView *view) {
                 for (id reg in regions) {
                     if ([reg respondsToSelector:selFrame]) {
                         CGRect r = ((CGRect (*)(id, SEL))objc_msgSend)(reg, selFrame);
-                        // Check if this occlusion region is in the top-right corner
                         if (r.origin.y < 80.0 && r.size.width > 20.0 && (r.origin.x + r.size.width) > winW * 0.55) {
                             return r;
                         }
@@ -86,23 +75,20 @@ static CGRect duo_queryTopRightNotificationRect(UIView *view) {
         }
     }
 
-    // 2. Fallback: Query windowScene.statusBarManager.statusBarFrame
     if (win && win.windowScene && win.windowScene.statusBarManager) {
         CGRect sbFrame = win.windowScene.statusBarManager.statusBarFrame;
         if (sbFrame.size.height > 0 && sbFrame.size.height < 90.0) {
-            // If statusBarFrame is a top-right pill, use its exact rect;
-            // if it spans full width, the actual right status cluster occupies the rightmost ~106pt.
             if (sbFrame.origin.x > winW * 0.5 && sbFrame.size.width > 20.0) {
                 return sbFrame;
             }
-            return CGRectMake(winW - 106.0, sbFrame.origin.y, 106.0, sbFrame.size.height);
+            return CGRectMake(winW - 108.0, sbFrame.origin.y, 108.0, sbFrame.size.height);
         }
     }
     return CGRectZero;
 }
 
 // ============================================================================
-// 6. One-Way setFrame: Input Adjustment (Zero layoutSubviews hooks = Zero Freeze!)
+// 5. One-Way setFrame: Input Adjustment (Zero layoutSubviews hook = Zero Freeze)
 // ============================================================================
 static BOOL gInTopBarSetFrame = NO;
 static void (*orig_topBar_setFrame)(UIView *self, SEL _cmd, CGRect frame) = NULL;
@@ -117,7 +103,6 @@ static void duo_topBar_setFrame(UIView *self, SEL _cmd, CGRect frame) {
             if (frame.origin.x <= 20.0 && frame.size.width > safeMaxWidth) {
                 frame.size.width = safeMaxWidth - frame.origin.x;
             }
-            // Align topBar vertically with the notification bar center if topBar is in the top zone
             if (frame.origin.y >= 0 && frame.origin.y < 90.0 && frame.size.height > 20.0 && frame.size.height < 80.0 && notifRect.size.height > 10.0) {
                 CGFloat alignedY = notifRect.origin.y + (notifRect.size.height - frame.size.height) * 0.5;
                 if (alignedY < 4.0) alignedY = 4.0;
@@ -151,6 +136,90 @@ static void duo_tabBar_setFrame(UIView *self, SEL _cmd, CGRect frame) {
     }
     if (orig_tabBar_setFrame) {
         orig_tabBar_setFrame(self, _cmd, frame);
+    }
+}
+
+// ============================================================================
+// 6. Safe Transform-Based Right Interaction Buttons Alignment (Never Freezes!)
+// ============================================================================
+// Modifying CGAffineTransform does NOT trigger AutoLayout or layoutSubviews recursion!
+static void duo_alignRightStackWithTransform(UIView *rootView, UIWindow *win) {
+    if (!rootView || !win) return;
+    CGFloat winW = win.bounds.size.width;
+    if (winW <= 500) {
+        // Outer screen: reset any translation transform if present
+        for (UIView *sub in rootView.subviews) {
+            NSString *clsName = NSStringFromClass([sub class]);
+            if ([clsName containsString:@"RightElement"] || [clsName isEqualToString:@"AWEElementStackView"]) {
+                if (!CGAffineTransformIsIdentity(sub.transform)) {
+                    sub.transform = CGAffineTransformIdentity;
+                }
+            }
+            if (sub.subviews.count > 0 && sub.subviews.count < 25) {
+                duo_alignRightStackWithTransform(sub, win);
+            }
+        }
+        return;
+    }
+
+    for (UIView *sub in rootView.subviews) {
+        NSString *clsName = NSStringFromClass([sub class]);
+        CGRect bounds = sub.bounds;
+        // Identify the narrow vertical stack of right buttons (Avatar, Like, Comment, Favorite, Share)
+        BOOL isRightTarget = ([clsName containsString:@"RightElementContainer"] ||
+                              [clsName isEqualToString:@"AWEElementStackView"]);
+        if (isRightTarget && bounds.size.width >= 36 && bounds.size.width <= 125 && bounds.size.height >= 180) {
+            // Compute where this view actually sits on screen WITHOUT transform
+            CGAffineTransform saved = sub.transform;
+            sub.transform = CGAffineTransformIdentity;
+            CGRect rectInWin = [sub convertRect:sub.bounds toView:win];
+            CGFloat targetX = winW - rectInWin.size.width - 10.0;
+            CGFloat dx = targetX - rectInWin.origin.x;
+            if (dx > 40.0) {
+                sub.transform = CGAffineTransformMakeTranslation(dx, 0);
+            } else {
+                sub.transform = saved;
+            }
+            continue;
+        }
+        if (sub.subviews.count > 0 && sub.subviews.count < 25) {
+            duo_alignRightStackWithTransform(sub, win);
+        }
+    }
+}
+
+static void (*orig_playInteraction_viewDidAppear)(UIViewController *self, SEL _cmd, BOOL animated) = NULL;
+static void duo_playInteraction_viewDidAppear(UIViewController *self, SEL _cmd, BOOL animated) {
+    if (orig_playInteraction_viewDidAppear) {
+        orig_playInteraction_viewDidAppear(self, _cmd, animated);
+    }
+    dispatch_async(dispatch_get_main_queue(), ^{
+        if (self.view && self.view.window) {
+            duo_alignRightStackWithTransform(self.view, self.view.window);
+        }
+    });
+}
+
+static BOOL gInRightContainerSetFrame = NO;
+static void (*orig_rightContainer_setFrame)(UIView *self, SEL _cmd, CGRect frame) = NULL;
+static void duo_rightContainer_setFrame(UIView *self, SEL _cmd, CGRect frame) {
+    if (!gInRightContainerSetFrame) {
+        gInRightContainerSetFrame = YES;
+        UIWindow *win = self.window;
+        if (win && win.bounds.size.width > 500 && frame.size.width >= 36 && frame.size.width <= 125 && frame.size.height >= 180) {
+            // Check superview width; if superview is full width, push frame.origin.x directly
+            UIView *sup = self.superview;
+            if (sup && sup.bounds.size.width > 500) {
+                CGFloat targetX = sup.bounds.size.width - frame.size.width - 10.0;
+                if (frame.origin.x < targetX - 40.0) {
+                    frame.origin.x = targetX;
+                }
+            }
+        }
+        gInRightContainerSetFrame = NO;
+    }
+    if (orig_rightContainer_setFrame) {
+        orig_rightContainer_setFrame(self, _cmd, frame);
     }
 }
 
@@ -188,8 +257,7 @@ static void hookOrAddMethod(Class cls, SEL sel, IMP imp, const char *types, IMP 
 static void applyAwemeCoreDeepAdaptation(void) {
     static dispatch_once_t onceToken;
     dispatch_once(&onceToken, ^{
-        // 1. Force AWEPad* AND AWEFold* layout classes to return NO so Douyin never pushes
-        // the right interaction buttons (Like/Comment/Favorite/Share) to the middle of the screen!
+        // 1. Force AWEPad* & AWEFold* checks to return NO
         NSArray<NSString *> *padAndFoldClasses = @[
             @"AWEPadModuleAdapter", @"AWEPadBizUIAdapter", @"AWEPadFullPageAdapter",
             @"AWEPadSplitScreenAdapter", @"AWEPadSplitScreenAdapterImpl",
@@ -198,9 +266,7 @@ static void applyAwemeCoreDeepAdaptation(void) {
             @"AWEPadUserPageAdapter", @"AWEPadDetailTableAdapter", @"AWEPadPureModeAdapter",
             @"AWEDeviceManager", @"UIDevice",
             @"AWEFoldDeviceDetector", @"AWEPlayInteractionFoldElementLayoutService",
-            @"AWEPlayInteractionFoldRightElementLayout", @"AWEPlayInteractionElementContainer",
-            @"AWEPlayInteractionRightElementContainer", @"AWEPlayInteractionViewController",
-            @"AWEDetailFoldAdaptUtil", @"AWEDCFeedPadFoldUtil"
+            @"AWEPlayInteractionFoldRightElementLayout"
         ];
         NSArray<NSString *> *disableSelectors = @[
             @"isPad", @"isIPad", @"isIpad", @"isiPad", @"isPadDevice", @"isIPadDevice",
@@ -208,11 +274,8 @@ static void applyAwemeCoreDeepAdaptation(void) {
             @"cj_isPad", @"deviceIsIpad", @"checkIsPad", @"htslive_isiPad",
             @"puzzle_isiPad", @"sc_isPadDevice", @"isPadUI", @"isPadSplitScreen",
             @"isPadSplit", @"isPadSplitStyle", @"isPadLayout", @"isPadAdaptionMode",
-            @"isInSplitScreen",
-            @"isFoldDevice", @"isFold", @"p_isFoldDevice", @"isDynamicFoldDevice",
-            @"shouldUseFoldElementLayout", @"shouldUseFoldableLayout",
-            @"isPadOrFold", @"isPadOrFoldDevice", @"isPadOrFoldAdaptationEnabled",
-            @"padOrFoldLayoutEnabled", @"shouldAdaptPadFoldLayout"
+            @"isInSplitScreen", @"isFoldDevice", @"isFold", @"p_isFoldDevice",
+            @"isDynamicFoldDevice", @"shouldUseFoldElementLayout", @"shouldUseFoldableLayout"
         ];
         for (NSString *clsName in padAndFoldClasses) {
             Class cls = NSClassFromString(clsName);
@@ -229,38 +292,29 @@ static void applyAwemeCoreDeepAdaptation(void) {
             }
         }
 
-        Class foldDetector = NSClassFromString(@"AWEFoldDeviceDetector");
-        if (foldDetector) {
-            Class metaFold = object_getClass(foldDetector);
-            SEL listSel = sel_registerName("foldDeviceModelList");
-            SEL defListSel = sel_registerName("defaultFoldDeviceModelList");
-            if (class_getInstanceMethod(foldDetector, listSel)) {
-                hookOrAddMethod(foldDetector, listSel, (IMP)duo_emptyFoldDeviceModelList, "@@:", NULL);
-            }
-            if (class_getInstanceMethod(foldDetector, defListSel)) {
-                hookOrAddMethod(foldDetector, defListSel, (IMP)duo_emptyFoldDeviceModelList, "@@:", NULL);
-            }
-            if (metaFold && class_getInstanceMethod(metaFold, listSel)) {
-                hookOrAddMethod(metaFold, listSel, (IMP)duo_emptyFoldDeviceModelList, "@@:", NULL);
-            }
-            if (metaFold && class_getInstanceMethod(metaFold, defListSel)) {
-                hookOrAddMethod(metaFold, defListSel, (IMP)duo_emptyFoldDeviceModelList, "@@:", NULL);
-            }
-        }
-
-        // 2. Pin AWENormalModeTabBar to bottom via setFrame: only
+        // 2. Pin AWENormalModeTabBar to bottom via setFrame:
         Class aweTabBarCls = NSClassFromString(@"AWENormalModeTabBar");
         if (aweTabBarCls) {
             hookOrAddMethod(aweTabBarCls, @selector(setFrame:), (IMP)duo_tabBar_setFrame, "v@:{CGRect={CGPoint=dd}{CGSize=dd}}", (IMP *)&orig_tabBar_setFrame);
         }
 
-        // 3. Adjust AWEFeedTopBarContainer via setFrame: only (using queried notification bar bounds, zero layoutSubviews loop!)
+        // 3. Adjust AWEFeedTopBarContainer via setFrame:
         Class topBarCls = NSClassFromString(@"AWEFeedTopBarContainer");
         if (topBarCls) {
             hookOrAddMethod(topBarCls, @selector(setFrame:), (IMP)duo_topBar_setFrame, "v@:{CGRect={CGPoint=dd}{CGSize=dd}}", (IMP *)&orig_topBar_setFrame);
         }
 
-        // 4. Disable vertical bar on all AWE TabBar/Navigation subclasses
+        // 4. Pin Right Interaction Buttons safely via setFrame: + CGAffineTransform on viewDidAppear:
+        Class rightContainerCls = NSClassFromString(@"AWEPlayInteractionRightElementContainer");
+        if (rightContainerCls) {
+            hookOrAddMethod(rightContainerCls, @selector(setFrame:), (IMP)duo_rightContainer_setFrame, "v@:{CGRect={CGPoint=dd}{CGSize=dd}}", (IMP *)&orig_rightContainer_setFrame);
+        }
+        Class playInteractionVC = NSClassFromString(@"AWEPlayInteractionViewController");
+        if (playInteractionVC) {
+            hookOrAddMethod(playInteractionVC, @selector(viewDidAppear:), (IMP)duo_playInteraction_viewDidAppear, "v@:B", (IMP *)&orig_playInteraction_viewDidAppear);
+        }
+
+        // 5. Disable vertical bar on all AWE TabBar/Navigation subclasses
         SEL selVertBehavior = sel_registerName("preferredVerticalBarBehavior");
         SEL selChildVert = sel_registerName("childForPreferredVerticalBarBehavior");
         NSArray<NSString *> *aweVCClasses = @[
