@@ -1,0 +1,43 @@
+name: Build iPhone Duo Adapt Dylib
+
+on:
+  push:
+    branches: ["main", "master"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Compile DuoAdapt.dylib for arm64 & arm64e
+        run: |
+          SDK_PATH=$(xcrun --sdk iphoneos --show-sdk-path)
+          xcrun --sdk iphoneos clang -dynamiclib \
+            -arch arm64 -arch arm64e \
+            -isysroot "$SDK_PATH" \
+            -miphoneos-version-min=15.0 \
+            -fobjc-arc \
+            -framework Foundation -framework UIKit -framework CoreGraphics \
+            -install_name "@executable_path/Frameworks/请别暂停音乐_2.3.1.dylib" \
+            DuoAdapt.m -o DuoAdapt.dylib
+          codesign -f -s - DuoAdapt.dylib
+          file DuoAdapt.dylib
+          otool -L DuoAdapt.dylib
+
+      - name: Upload Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: DuoAdapt-dylib
+          path: DuoAdapt.dylib
+
+      - name: Publish Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release delete v1.0.0 -y --cleanup-tag || true
+          gh release create v1.0.0 DuoAdapt.dylib --title "iPhone Duo iOS 27.1 Adapt Dylib" --notes "Compiled arm64/arm64e dylib for iPhone Duo adaptation"
