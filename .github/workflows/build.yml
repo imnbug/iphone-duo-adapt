@@ -14,11 +14,11 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Compile DuoAdapt.dylib for arm64 & arm64e
+      - name: Compile DuoAdapt.dylib for arm64
         run: |
           SDK_PATH=$(xcrun --sdk iphoneos --show-sdk-path)
           xcrun --sdk iphoneos clang -dynamiclib \
-            -arch arm64 -arch arm64e \
+            -arch arm64 \
             -isysroot "$SDK_PATH" \
             -miphoneos-version-min=15.0 \
             -fobjc-arc \
