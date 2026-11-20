@@ -1,4 +1,4 @@
-// DuoAdapt.m - iPhone Duo (iOS 27.1) Safe Transform-Based UIKit Adaptation for Douyin
+// DuoAdapt.m - iPhone Duo (iOS 27.1) Safe Transform + HitTest UIKit Adaptation for Douyin
 #import <UIKit/UIKit.h>
 #import <objc/runtime.h>
 #import <objc/message.h>
@@ -69,55 +69,179 @@ static void duo_tabBar_setFrame(UIView *self, SEL _cmd, CGRect frame) {
 }
 
 // ============================================================================
-// 5. Safe Transform-Only Right Interaction Buttons Alignment (ZERO layout loop!)
+// 5. HitTest Forwarding for Transformed Views Outside Parent Bounds
 // ============================================================================
-// IMPORTANT: Modifying `transform` NEVER triggers AutoLayout or layoutSubviews recursion!
-// We ONLY touch `sub.transform`, never `sub.frame` or `sub.bounds`.
-static void duo_pushRightButtonsToEdge(UIView *rootView, UIWindow *win, int depth) {
+static const void *kDuoForwardedViewsKey = &kDuoForwardedViewsKey;
+static const void *kDuoOrigHitTestKey = &kDuoOrigHitTestKey;
+
+static UIView *duo_forwardHitTest(UIView *self, SEL _cmd, CGPoint point, UIEvent *event) {
+    // Call original hitTest first
+    NSValue *origVal = objc_getAssociatedObject([self class], kDuoOrigHitTestKey);
+    UIView *hit = nil;
+    if (origVal) {
+        UIView *(*origIMP)(id, SEL, CGPoint, UIEvent *) = (UIView *(*)(id, SEL, CGPoint, UIEvent *))[origVal pointerValue];
+        if (origIMP) {
+            hit = origIMP(self, _cmd, point, event);
+        }
+    }
+    if (hit) return hit;
+
+    // If tap fell outside self.bounds (e.g. on right black margin where right buttons were translated),
+    // forward hitTest directly to our registered translated views!
+    if (self.hidden || !self.userInteractionEnabled || self.alpha < 0.01) return nil;
+    NSHashTable<UIView *> *targets = objc_getAssociatedObject(self, kDuoForwardedViewsKey);
+    if (targets && targets.count > 0) {
+        for (UIView *target in targets) {
+            if (!target || target.hidden || !target.userInteractionEnabled || target.alpha < 0.01 || !target.window) {
+                continue;
+            }
+            CGPoint ptInTarget = [self convertPoint:point toView:target];
+            if ([target pointInside:ptInTarget withEvent:event]) {
+                UIView *subHit = [target hitTest:ptInTarget withEvent:event];
+                if (subHit) return subHit;
+            }
+        }
+    }
+    return nil;
+}
+
+static void duo_ensureHitTestHookOnClass(Class cls) {
+    if (!cls || cls == [UIView class] || cls == [UIWindow class]) return;
+    if (objc_getAssociatedObject(cls, kDuoOrigHitTestKey)) return;
+    Method m = class_getInstanceMethod(cls, @selector(hitTest:withEvent:));
+    if (!m) return;
+    IMP orig = method_getImplementation(m);
+    if (orig == (IMP)duo_forwardHitTest) return;
+    objc_setAssociatedObject(cls, kDuoOrigHitTestKey, [NSValue valueWithPointer:orig], OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    if (!class_addMethod(cls, @selector(hitTest:withEvent:), (IMP)duo_forwardHitTest, method_getTypeEncoding(m))) {
+        method_setImplementation(m, (IMP)duo_forwardHitTest);
+    }
+}
+
+static void duo_registerForwardedTargetOnAncestors(UIView *target, UIView *stopAtRoot) {
+    if (!target) return;
+    UIView *cur = target.superview;
+    int hops = 0;
+    while (cur && hops < 8) {
+        Class cls = [cur class];
+        if (cls != [UIView class] && cls != [UIWindow class]) {
+            duo_ensureHitTestHookOnClass(cls);
+            NSHashTable<UIView *> *set = objc_getAssociatedObject(cur, kDuoForwardedViewsKey);
+            if (!set) {
+                set = [NSHashTable weakObjectsHashTable];
+                objc_setAssociatedObject(cur, kDuoForwardedViewsKey, set, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+            }
+            [set addObject:target];
+        }
+        if (cur == stopAtRoot || [cur isKindOfClass:[UITableViewCell class]]) break;
+        cur = cur.superview;
+        hops++;
+    }
+}
+
+// ============================================================================
+// 6. Safe Transform-Only Right Buttons & Left Description Alignment
+// ============================================================================
+// - Right buttons (Avatar/Like/Comment/Favorite/Share/Music):
+//     Horizontal: align to right edge with 18pt breathing margin
+//     Vertical (when inner screen tall): shift down so bottom sits just above bottom TabBar
+// - Left description (Author/Caption):
+//     Vertical (when inner screen tall): shift down by same dy so it sits above bottom TabBar
+// - Outer screen: reset transforms cleanly
+static void duo_alignInteractionViews(UIView *rootView, UIView *vcRoot, UIWindow *win, int depth) {
     if (!rootView || !win || depth > 6) return;
     CGFloat winW = win.bounds.size.width;
+    CGFloat winH = win.bounds.size.height;
+
     if (winW <= 480.0) {
-        // On outer compact screen: reset transform if we applied one earlier
         for (UIView *sub in rootView.subviews) {
-            if (sub.tag == 271001) {
+            if (sub.tag == 271001 || sub.tag == 271002) {
                 sub.transform = CGAffineTransformIdentity;
                 sub.tag = 0;
             }
             if (sub.subviews.count > 0 && sub.subviews.count < 25) {
-                duo_pushRightButtonsToEdge(sub, win, depth + 1);
+                duo_alignInteractionViews(sub, vcRoot, win, depth + 1);
             }
         }
         return;
     }
 
+    // Target bottom Y just above the bottom TabBar (~104pt from screen bottom)
+    CGFloat targetBottomY = winH - 104.0;
+    BOOL isTallInnerScreen = (winH > 760.0);
+
     for (UIView *sub in rootView.subviews) {
         CGRect b = sub.bounds;
         NSString *clsName = NSStringFromClass([sub class]);
-        BOOL isCandidate = (b.size.width >= 36.0 && b.size.width <= 130.0 && b.size.height >= 160.0) &&
-                           ([clsName containsString:@"RightElement"] ||
-                            [clsName containsString:@"RightContainer"] ||
-                            [clsName isEqualToString:@"AWEElementStackView"] ||
-                            [clsName isEqualToString:@"AWEElementContainer"]);
-        if (isCandidate) {
-            // Calculate untransformed position in window coordinates
-            CGAffineTransform prev = sub.transform;
-            if (!CGAffineTransformIsIdentity(prev)) {
+
+        BOOL isRightStack = (b.size.width >= 36.0 && b.size.width <= 130.0 && b.size.height >= 160.0) &&
+                            ([clsName containsString:@"RightElement"] ||
+                             [clsName containsString:@"RightContainer"] ||
+                             [clsName isEqualToString:@"AWEElementStackView"] ||
+                             [clsName isEqualToString:@"AWEElementContainer"]);
+
+        if (isRightStack) {
+            if (!CGAffineTransformIsIdentity(sub.transform)) {
                 sub.transform = CGAffineTransformIdentity;
             }
             CGRect rectInWin = [sub convertRect:b toView:win];
-            CGFloat desiredX = winW - rectInWin.size.width - 12.0;
+            // Right edge with 18pt comfortable margin
+            CGFloat desiredX = winW - rectInWin.size.width - 18.0;
             CGFloat dx = desiredX - rectInWin.origin.x;
-            if (dx > 25.0) {
-                sub.transform = CGAffineTransformMakeTranslation(dx, 0);
+            if (dx < 20.0) dx = 0.0;
+
+            CGFloat dy = 0.0;
+            if (isTallInnerScreen) {
+                CGFloat maxY = CGRectGetMaxY(rectInWin);
+                CGFloat diffY = targetBottomY - maxY;
+                if (diffY > 40.0 && diffY < winH * 0.48) {
+                    dy = diffY;
+                }
+            }
+
+            if (dx > 0.5 || dy > 0.5) {
+                sub.transform = CGAffineTransformMakeTranslation(dx, dy);
                 sub.tag = 271001;
+                duo_registerForwardedTargetOnAncestors(sub, vcRoot);
             } else {
                 sub.transform = CGAffineTransformIdentity;
                 if (sub.tag == 271001) sub.tag = 0;
             }
             continue;
         }
+
+        // Check Left Description / Author stack (wide narrow-height stack floating in middle on tall screen)
+        BOOL isLeftStack = isTallInnerScreen &&
+                           (b.size.width >= 150.0 && b.size.width <= 460.0 && b.size.height >= 40.0 && b.size.height <= 360.0) &&
+                           ([clsName containsString:@"LeftElement"] ||
+                            [clsName containsString:@"LeftContainer"] ||
+                            [clsName isEqualToString:@"AWEElementStackView"] ||
+                            [clsName isEqualToString:@"AWEElementContainer"]);
+
+        if (isLeftStack) {
+            if (!CGAffineTransformIsIdentity(sub.transform)) {
+                sub.transform = CGAffineTransformIdentity;
+            }
+            CGRect rectInWin = [sub convertRect:b toView:win];
+            // Only shift if it's in the middle-lower portion (not top bar!) and floating way above bottom bar
+            if (rectInWin.origin.y > winH * 0.25 && rectInWin.origin.x < winW * 0.45) {
+                CGFloat maxY = CGRectGetMaxY(rectInWin);
+                CGFloat diffY = targetBottomY - maxY;
+                if (diffY > 40.0 && diffY < winH * 0.48) {
+                    sub.transform = CGAffineTransformMakeTranslation(0, diffY);
+                    sub.tag = 271002;
+                    duo_registerForwardedTargetOnAncestors(sub, vcRoot);
+                    continue;
+                }
+            }
+            if (sub.tag == 271002) {
+                sub.transform = CGAffineTransformIdentity;
+                sub.tag = 0;
+            }
+        }
+
         if (sub.subviews.count > 0 && sub.subviews.count < 25) {
-            duo_pushRightButtonsToEdge(sub, win, depth + 1);
+            duo_alignInteractionViews(sub, vcRoot, win, depth + 1);
         }
     }
 }
@@ -129,7 +253,7 @@ static void duo_playInteraction_viewDidLayoutSubviews(UIViewController *self, SE
     }
     UIView *v = self.view;
     if (v && v.window) {
-        duo_pushRightButtonsToEdge(v, v.window, 0);
+        duo_alignInteractionViews(v, v, v.window, 0);
     }
 }
 
@@ -167,7 +291,7 @@ static void hookOrAddMethod(Class cls, SEL sel, IMP imp, const char *types, IMP 
 static void applyAwemeCoreDeepAdaptation(void) {
     static dispatch_once_t onceToken;
     dispatch_once(&onceToken, ^{
-        // 1. Force AWEPad* classes to return NO (keep native AWEFoldDeviceDetector untouched!)
+        // 1. Force AWEPad* classes to return NO
         NSArray<NSString *> *padClasses = @[
             @"AWEPadModuleAdapter", @"AWEPadBizUIAdapter", @"AWEPadFullPageAdapter",
             @"AWEPadSplitScreenAdapter", @"AWEPadSplitScreenAdapterImpl",
@@ -205,7 +329,7 @@ static void applyAwemeCoreDeepAdaptation(void) {
             hookOrAddMethod(aweTabBarCls, @selector(setFrame:), (IMP)duo_tabBar_setFrame, "v@:{CGRect={CGPoint=dd}{CGSize=dd}}", (IMP *)&orig_tabBar_setFrame);
         }
 
-        // 3. Push Right Interaction Buttons to right edge using safe CGAffineTransform in viewDidLayoutSubviews
+        // 3. Align Right Buttons & Left Description + Enable HitTest Forwarding
         Class playInteractionVC = NSClassFromString(@"AWEPlayInteractionViewController");
         if (playInteractionVC) {
             hookOrAddMethod(playInteractionVC, @selector(viewDidLayoutSubviews), (IMP)duo_playInteraction_viewDidLayoutSubviews, "v@:", (IMP *)&orig_playInteraction_viewDidLayoutSubviews);
