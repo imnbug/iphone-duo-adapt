@@ -129,9 +129,13 @@ static void duo_align(UIView *root, UIView *vcRoot, UIWindow *win, int depth) {
 
             CGFloat dx = 0, dy = 0;
             if (isRight) {
-                CGFloat targetX = W - b.size.width - 18.0;
-                dx = targetX - rawX;
-                if (dx < 20.0 || dx > W * 0.55) dx = 0;
+                // Keep the right rail inside the window safe area.
+                CGRect safeBounds = UIEdgeInsetsInsetRect(win.bounds, win.safeAreaInsets);
+                CGFloat targetX = CGRectGetMaxX(safeBounds) - b.size.width - 18.0;
+                if (targetX >= CGRectGetMinX(safeBounds)) {
+                    dx = MAX(0.0, targetX - rawX);
+                    if (dx < 1.0) dx = 0.0;
+                }
             } else if (rawX > W * 0.45 || rawY < H * 0.25) {
                 // not the bottom-left caption block
                 if (sub.subviews.count > 0 && sub.subviews.count < 25) duo_align(sub, vcRoot, win, depth + 1);
