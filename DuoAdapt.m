@@ -88,13 +88,42 @@ static void duo_align(UIView *root, UIView *vcRoot, UIWindow *win, int depth) {
     if (!root || depth > 6) return;
     CGFloat W = win.bounds.size.width, H = win.bounds.size.height;
     BOOL wide = W > 480.0;
-    BOOL tall = H > 760.0;
-    CGFloat targetBottom = H - 104.0;
+    BOOL portrait = H > W;
+    CGRect safeBounds = UIEdgeInsetsInsetRect(win.bounds, win.safeAreaInsets);
+    CGFloat portraitBottom = CGRectGetMaxY(safeBounds) - 104.0;
 
     for (UIView *sub in root.subviews) {
         CGRect b = sub.bounds;
         const char *cn = class_getName([sub class]);
         if (!cn) continue;
+
+        if (!strcmp(cn, "AWEFeedProgressSlider")) {
+            if (!wide) {
+                if (objc_getAssociatedObject(sub, kDuoMovedKey)) {
+                    duo_setTranslation(sub, 0, 0);
+                    objc_setAssociatedObject(sub, kDuoMovedKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+                }
+                continue;
+            }
+
+            CGAffineTransform t = sub.transform;
+            CGRect current = [sub convertRect:b toView:win];
+            CGRect original = CGRectOffset(current, -t.tx, -t.ty);
+            CGFloat targetBottom = CGRectGetMaxY(safeBounds) - 92.0;
+            if (CGRectIntersectsRect(original, win.bounds) &&
+                targetBottom - CGRectGetHeight(original) >= CGRectGetMinY(safeBounds)) {
+                CGFloat dy = targetBottom - CGRectGetMaxY(original);
+                duo_setTranslation(sub, 0, dy);
+                if (fabs(dy) > 0.5) {
+                    objc_setAssociatedObject(sub, kDuoMovedKey, @YES, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+                    duo_registerForward(sub, vcRoot);
+                }
+            } else if (objc_getAssociatedObject(sub, kDuoMovedKey)) {
+                duo_setTranslation(sub, 0, 0);
+                objc_setAssociatedObject(sub, kDuoMovedKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+            }
+            continue;
+        }
 
         BOOL isRight = (b.size.width >= 36 && b.size.width <= 130 && b.size.height >= 160) &&
             (strstr(cn, "RightElement") || strstr(cn, "RightContainer") ||
@@ -118,9 +147,11 @@ static void duo_align(UIView *root, UIView *vcRoot, UIWindow *win, int depth) {
             CGFloat rawY = r.origin.y - t.ty;
             CGFloat rawMaxY = CGRectGetMaxY(r) - t.ty;
 
-            // Safety guard: if the view is off-screen (e.g. preloading cell or horizontal swipe transition),
-            // reset transform to identity and never kick it off-screen!
-            if (rawX < -10.0 || rawX + b.size.width > W + 10.0 || rawY < -10.0 || rawMaxY > H + 10.0) {
+            // Skip off-screen cells, but allow a partially clipped right rail to recover.
+            BOOL outsideX = rawX < -10.0 || rawX + b.size.width > W + 10.0;
+            BOOL outsideY = isRight ? (rawMaxY <= 0.0 || rawY >= H)
+                                    : (rawY < -10.0 || rawMaxY > H + 10.0);
+            if (outsideX || outsideY) {
                 duo_setTranslation(sub, 0, 0);
                 continue;
             }
@@ -128,23 +159,31 @@ static void duo_align(UIView *root, UIView *vcRoot, UIWindow *win, int depth) {
             CGFloat dx = 0, dy = 0;
             if (isRight) {
                 // Keep the right rail inside the window safe area.
-                CGRect safeBounds = UIEdgeInsetsInsetRect(win.bounds, win.safeAreaInsets);
                 CGFloat targetX = CGRectGetMaxX(safeBounds) - b.size.width - 18.0;
                 if (targetX >= CGRectGetMinX(safeBounds)) {
-                    dx = MAX(0.0, targetX - rawX);
-                    if (dx < 1.0) dx = 0.0;
+                    dx = targetX - rawX;
+                    if (fabs(dx) < 1.0) dx = 0.0;
                 }
             } else if (rawX > W * 0.45 || rawY < H * 0.25) {
                 // not the bottom-left caption block
                 if (sub.subviews.count > 0 && sub.subviews.count < 25) duo_align(sub, vcRoot, win, depth + 1);
                 continue;
             }
-            if (tall) {
-                CGFloat diff = targetBottom - rawMaxY;
-                if (diff > 40.0 && diff < H * 0.45 && (rawMaxY + diff) <= H - 80.0) dy = diff;
+            if (portrait && portraitBottom - (rawMaxY - rawY) >= CGRectGetMinY(safeBounds) + 12.0) {
+                dy = portraitBottom - rawMaxY;
+            }
+            if (isRight) {
+                CGFloat minimumDY = CGRectGetMinY(safeBounds) + 12.0 - rawY;
+                CGFloat maximumDY = CGRectGetMaxY(safeBounds) - 12.0 - rawMaxY;
+                if (minimumDY > maximumDY && rawMaxY - rawY <= CGRectGetHeight(safeBounds)) {
+                    minimumDY -= 12.0;
+                    maximumDY += 12.0;
+                }
+                // If the rail cannot fit, prioritize keeping its first button accessible.
+                dy = minimumDY <= maximumDY ? MIN(MAX(dy, minimumDY), maximumDY) : minimumDY;
             }
             duo_setTranslation(sub, dx, dy);
-            if (dx > 0.5 || dy > 0.5) {
+            if (fabs(dx) > 0.5 || fabs(dy) > 0.5) {
                 objc_setAssociatedObject(sub, kDuoMovedKey, @YES, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
                 duo_registerForward(sub, vcRoot);
             }
