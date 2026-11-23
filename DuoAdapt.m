@@ -12,10 +12,8 @@ static id duo_childForPreferredVerticalBarBehavior(id self, SEL _cmd) { return n
 static NSInteger duo_tabBarControllerMode(id self, SEL _cmd) { return 1; }
 static void duo_setTabBarControllerMode(id self, SEL _cmd, NSInteger mode) {}
 
-// ---------- 3. Phone idiom / compact ----------
+// ---------- 3. Phone idiom ----------
 static NSInteger duo_userInterfaceIdiom(id self, SEL _cmd) { return 0; }
-static NSInteger duo_horizontalSizeClass(id self, SEL _cmd) { return 1; }
-static NSInteger duo_verticalSizeClass(id self, SEL _cmd) { return 2; }
 static BOOL duo_returnNO(id self, SEL _cmd) { return NO; }
 
 // ---------- 4. Bottom TabBar guard ----------
@@ -205,8 +203,6 @@ static void duo_adapt_init(void) {
 
         hookOrAdd([UIDevice class], @selector(userInterfaceIdiom), (IMP)duo_userInterfaceIdiom, "q@:", NULL);
         hookOrAdd([UITraitCollection class], @selector(userInterfaceIdiom), (IMP)duo_userInterfaceIdiom, "q@:", NULL);
-        hookOrAdd([UITraitCollection class], @selector(horizontalSizeClass), (IMP)duo_horizontalSizeClass, "q@:", NULL);
-        hookOrAdd([UITraitCollection class], @selector(verticalSizeClass), (IMP)duo_verticalSizeClass, "q@:", NULL);
 
         // global, single hitTest hook on UIView
         Method hm = class_getInstanceMethod([UIView class], @selector(hitTest:withEvent:));
